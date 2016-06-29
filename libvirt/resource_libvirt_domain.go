@@ -1,7 +1,6 @@
 package libvirt
 
 import (
-	"bytes"
 	"encoding/xml"
 	"fmt"
 	"log"
@@ -24,11 +23,18 @@ func resourceLibvirtDomain() *schema.Resource {
 		Delete: resourceLibvirtDomainDelete,
 		Update: resourceLibvirtDomainUpdate,
 		Exists: resourceLibvirtDomainExists,
+
 		Schema: map[string]*schema.Schema{
 			"name": &schema.Schema{
 				Type:     schema.TypeString,
 				Required: true,
 				ForceNew: true,
+			},
+			"metadata": &schema.Schema{
+				Type:     schema.TypeString,
+				Required: false,
+				Optional: true,
+				ForceNew: false,
 			},
 			"vcpu": &schema.Schema{
 				Type:     schema.TypeInt,
@@ -46,6 +52,12 @@ func resourceLibvirtDomain() *schema.Resource {
 				Type:     schema.TypeBool,
 				Optional: true,
 				Default:  true,
+				ForceNew: false,
+			},
+			"cloudinit": &schema.Schema{
+				Type:     schema.TypeString,
+				Required: false,
+				Optional: true,
 				ForceNew: false,
 			},
 			"disk": &schema.Schema{
@@ -94,7 +106,7 @@ func resourceLibvirtDomainCreate(d *schema.ResourceData, meta interface{}) error
 	domainDef.VCpu.Amount = d.Get("vcpu").(int)
 
 	disksCount := d.Get("disk.#").(int)
-	disks := make([]defDisk, 0, disksCount)
+	var disks []defDisk
 	for i := 0; i < disksCount; i++ {
 		prefix := fmt.Sprintf("disk.%d", i)
 		disk := newDefDisk()
@@ -124,6 +136,14 @@ func resourceLibvirtDomainCreate(d *schema.ResourceData, meta interface{}) error
 		disks = append(disks, disk)
 	}
 
+	if cloudinit, ok := d.GetOk("cloudinit"); ok {
+		disk, err := newDiskForCloudInit(virConn, cloudinit.(string))
+		if err != nil {
+			return err
+		}
+		disks = append(disks, disk)
+	}
+
 	netIfacesCount := d.Get("network_interface.#").(int)
 	netIfaces := make([]defNetworkInterface, 0, netIfacesCount)
 	partialNetIfaces := make(map[string]bool, netIfacesCount)
@@ -142,7 +162,7 @@ func resourceLibvirtDomainCreate(d *schema.ResourceData, meta interface{}) error
 		}
 		netIface.Mac.Address = mac
 
-		// this is not passes to libvirt, but used by waitForAddress
+		// this is not passed to libvirt, but used by waitForAddress
 		if waitForLease, ok := d.GetOk(prefix + ".wait_for_lease"); ok {
 			netIface.waitForLease = waitForLease.(bool)
 		}
@@ -194,6 +214,12 @@ func resourceLibvirtDomainCreate(d *schema.ResourceData, meta interface{}) error
 		netIfaces = append(netIfaces, netIface)
 	}
 
+	if metadata, ok := d.GetOk("metadata"); ok {
+		domainDef.Metadata.TerraformLibvirt.Xml = metadata.(string)
+	}
+
+	domainDef.Memory.Amount = d.Get("memory").(int)
+	domainDef.VCpu.Amount = d.Get("vcpu").(int)
 	domainDef.Devices.Disks = disks
 	domainDef.Devices.NetworkInterfaces = netIfaces
 
@@ -217,7 +243,7 @@ func resourceLibvirtDomainCreate(d *schema.ResourceData, meta interface{}) error
 
 	err = domain.Create()
 	if err != nil {
-		return fmt.Errorf("Error crearing libvirt domain: %s", err)
+		return fmt.Errorf("Error creating libvirt domain: %s", err)
 	}
 	defer domain.Free()
 
@@ -283,6 +309,7 @@ func resourceLibvirtDomainUpdate(d *schema.ResourceData, meta interface{}) error
 	if virConn == nil {
 		return fmt.Errorf("The libvirt connection was nil.")
 	}
+
 	domain, err := virConn.LookupByUUIDString(d.Id())
 	if err != nil {
 		return fmt.Errorf("Error retrieving libvirt domain: %s", err)
@@ -296,7 +323,45 @@ func resourceLibvirtDomainUpdate(d *schema.ResourceData, meta interface{}) error
 	if !running {
 		err = domain.Create()
 		if err != nil {
-			return fmt.Errorf("Error crearing libvirt domain: %s", err)
+			return fmt.Errorf("Error creating libvirt domain: %s", err)
+		}
+	}
+
+	if d.HasChange("metadata") {
+		//terraform-libvirt:user_data xmlns:terraform-libvirt="http://github.com/dmacvicar/terraform-provider-libvirt/"
+		metadata := defMetadata{}
+		metadata.TerraformLibvirt.Xml = d.Get("metadata").(string)
+		metadataToXml, err := xml.Marshal(metadata)
+		if err != nil {
+			return fmt.Errorf("Error serializing libvirt metadata: %s", err)
+		}
+
+		err = domain.SetMetadata(libvirt.VIR_DOMAIN_METADATA_ELEMENT,
+			string(metadataToXml),
+			"terraform-libvirt",
+			"http://github.com/dmacvicar/terraform-provider-libvirt/",
+			libvirt.VIR_DOMAIN_AFFECT_LIVE|libvirt.VIR_DOMAIN_AFFECT_CONFIG)
+		if err != nil {
+			return fmt.Errorf("Error changing domain metadata: %s", err)
+		}
+	}
+
+	if d.HasChange("cloudinit") {
+		cloudinit, err := newDiskForCloudInit(virConn, d.Get("cloudinit").(string))
+		if err != nil {
+			return err
+		}
+
+		data, err := xml.Marshal(cloudinit)
+		if err != nil {
+			return fmt.Errorf("Error serializing cloudinit disk: %s", err)
+		}
+
+		err = domain.UpdateDeviceFlags(
+			string(data),
+			libvirt.VIR_DOMAIN_AFFECT_CONFIG|libvirt.VIR_DOMAIN_AFFECT_CURRENT|libvirt.VIR_DOMAIN_AFFECT_LIVE)
+		if err != nil {
+			return fmt.Errorf("Error while changing the cloudinit volume: %s", err)
 		}
 	}
 
@@ -327,6 +392,7 @@ func resourceLibvirtDomainRead(d *schema.ResourceData, meta interface{}) error {
 	}
 
 	d.Set("name", domainDef.Name)
+	d.Set("metadata", domainDef.Metadata.TerraformLibvirt.Xml)
 	d.Set("vpu", domainDef.VCpu)
 	d.Set("memory", domainDef.Memory)
 
@@ -535,30 +601,49 @@ func isDomainRunning(domain libvirt.VirDomain) (bool, error) {
 	return state[0] == libvirt.VIR_DOMAIN_RUNNING, nil
 }
 
-func getHostXMLDesc(ip, mac, name string) string {
-	var b bytes.Buffer
-	b.WriteString("<host ")
-	if len(ip) > 0 {
-		b.WriteString(fmt.Sprintf(" ip=\"%s\"", ip))
-	}
-	if len(mac) > 0 {
-		b.WriteString(fmt.Sprintf(" mac=\"%s\"", mac))
-	}
-	if len(name) > 0 {
-		b.WriteString(fmt.Sprintf(" name=\"%s\"", name))
-	}
-	b.WriteString(" />")
-	return b.String()
-}
-
 // Adds a new static host to the network
 func addHost(n *libvirt.VirNetwork, ip, mac, name string) error {
-	return n.UpdateXMLDesc(getHostXMLDesc(ip, mac, name),
+	data, err := getHostXMLDesc(ip, mac, name)
+	if err != nil {
+		return err
+	}
+
+	return n.UpdateXMLDesc(data,
 		libvirt.VIR_NETWORK_UPDATE_COMMAND_ADD_LAST, libvirt.VIR_NETWORK_SECTION_IP_DHCP_HOST)
 }
 
 // Removes a static host from the network
 func removeHost(n *libvirt.VirNetwork, ip, mac, name string) error {
-	return n.UpdateXMLDesc(getHostXMLDesc(ip, mac, name),
+	data, err := getHostXMLDesc(ip, mac, name)
+	if err != nil {
+		return err
+	}
+	return n.UpdateXMLDesc(data,
 		libvirt.VIR_NETWORK_UPDATE_COMMAND_DELETE, libvirt.VIR_NETWORK_SECTION_IP_DHCP_HOST)
+}
+
+func newDiskForCloudInit(virConn *libvirt.VirConnection, volumeKey string) (defDisk, error) {
+	disk := newCDROM()
+
+	diskVolume, err := virConn.LookupStorageVolByKey(volumeKey)
+	if err != nil {
+		return disk, fmt.Errorf("Can't retrieve volume %s", volumeKey)
+	}
+	diskVolumeName, err := diskVolume.GetName()
+	if err != nil {
+		return disk, fmt.Errorf("Error retrieving volume name: %s", err)
+	}
+	diskPool, err := diskVolume.LookupPoolByVolume()
+	if err != nil {
+		return disk, fmt.Errorf("Error retrieving pool for volume: %s", err)
+	}
+	diskPoolName, err := diskPool.GetName()
+	if err != nil {
+		return disk, fmt.Errorf("Error retrieving pool name: %s", err)
+	}
+
+	disk.Source.Volume = diskVolumeName
+	disk.Source.Pool = diskPoolName
+
+	return disk, nil
 }

@@ -11,7 +11,7 @@ servers on a [libvirt](https://libvirt.org/) host via [Terraform](https://terraf
 
 * libvirt 1.2.14 or newer on the hypervisor
 
-The provider uses `virDomainInterfaceAddresses` which was added in 1.2.14. Distributions like Ubuntu 14.04 LTS ship 1.2.2. If you need a stable server distribution with a recent libvirt version, try [openSUSE Leap](https://www.opensuse.org/).
+The provider uses `virDomainInterfaceAddresses` which was added in 1.2.14. If you need a stable server distribution with a recent libvirt version, try [openSUSE Leap](https://www.opensuse.org/) or [Ubuntu](http://www.ubuntu.com/server) (from version 15.10 Wily Werewolf on).
 
 In the future, I may try to support older libvirt versions if I find a way to elegantely conditional compile the code and get the IP addresses with alternative methods.
 
@@ -66,8 +66,18 @@ $ terraform destroy
 1.  [Install Go](https://golang.org/doc/install) on your machine
 2.  [Set up Gopath](https://golang.org/doc/code.html)
 3.  `git clone` this repository into `$GOPATH/src/github.com/dmacvicar/terraform-provider-libvirt`
-4.  Run `go get` to get dependencies
-5.  Run `go install` to build the binary. You will now find the
+4.  Get the dependencies, either with `go get`
+    1. Run `go get`
+    2.  Switch the terraform project back to the stable version, otherwise you will get a `Incompatible API version with plugin. Plugin version: 1, Ours: 2` error at runtime:
+    ```
+    cd $GOPATH/src/github.com/hashicorp/terraform
+    git checkout v0.6.16
+    cd $GOPATH/src/github.com/dmacvicar/terraform-provider-libvirt
+    ```
+5.  .. or alternatively install [govend](https://github.com/govend/govend) and:
+    1. Run `govend`, which will scan dependencies and download them into vendor
+    2. problematic dependencies, like terraform, will be automatically in the right version thanks to the `vendor.yml` file.
+6.  Run `go install` to build the binary. You will now find the
     binary at `$GOPATH/bin/terraform-provider-libvirt`.
 
 ## Running
@@ -97,6 +107,8 @@ go test ./...
   cannot unlink file '/var/lib/libvirt/images/XXXXXXXXXXXX': Permission denied
   ```
   It is probably related and fixed in libvirt 1.3.3 (already available in openSUSE Tumbleweed).
+
+* On Ubuntu distros SELinux is enforced by qemu even if it is disabled globally, this might cause unexpected `Could not open '/var/lib/libvirt/images/<FILE_NAME>': Permission denied` errors. Double check that `security_driver = "none"` is uncommented in `/etc/libvirt/qemu.conf` and issue `sudo systemctl restart libvirt-bin` to restart the daemon.
 
 ## Author
 
