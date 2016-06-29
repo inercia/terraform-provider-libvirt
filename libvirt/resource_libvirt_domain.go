@@ -126,19 +126,21 @@ func resourceLibvirtDomainCreate(d *schema.ResourceData, meta interface{}) error
 
 	netIfacesCount := d.Get("network_interface.#").(int)
 	netIfaces := make([]defNetworkInterface, 0, netIfacesCount)
+	partialNetIfaces := make(map[string]bool, netIfacesCount)
 	for i := 0; i < netIfacesCount; i++ {
 		prefix := fmt.Sprintf("network_interface.%d", i)
 		netIface := newDefNetworkInterface()
 
-		if mac, ok := d.GetOk(prefix + ".mac"); ok {
-			netIface.Mac.Address = strings.ToUpper(mac.(string))
-		} else {
+		macI, ok := d.GetOk(prefix + ".mac")
+		mac := strings.ToUpper(macI.(string))
+		if !ok {
 			var err error
-			netIface.Mac.Address, err = RandomMACAddress()
+			mac, err = RandomMACAddress()
 			if err != nil {
 				return fmt.Errorf("Error generating mac address: %s", err)
 			}
 		}
+		netIface.Mac.Address = mac
 
 		// this is not passes to libvirt, but used by waitForAddress
 		if waitForLease, ok := d.GetOk(prefix + ".wait_for_lease"); ok {
@@ -176,15 +178,18 @@ func resourceLibvirtDomainCreate(d *schema.ResourceData, meta interface{}) error
 					// try to use the name from the domain definition when no hostname has been specified
 					hostname = domainDef.Name
 				}
+				log.Printf("[INFO] Adding ip/MAC/host=%s/%s/%s to %s", address, mac, hostname, networkName)
+				addHost(&network, address, mac, hostname)
 			} else {
 				if len(hostname) > 0 {
-					return fmt.Errorf("Cannot set hostname for '%s' when the 'address' has not been specified", d.Id())
+					log.Printf("[DEBUG] Will wait for an IP for hostname '%s'...", hostname)
+					partialNetIfaces[mac] = true
+				} else {
+					log.Printf("[INFO] Adding IP/MAC/host=%s/%s/%s to %s", address, mac, hostname, networkName)
+					addHost(&network, address, netIface.Mac.Address, hostname)
 				}
 			}
-			log.Printf("[INFO] Adding ip/MAC/host=%s/%s/%s to %s", address, netIface.Mac.Address, hostname, networkName)
-			addHost(&network, address, netIface.Mac.Address, hostname)
 		}
-
 		netIface.Source.Network = networkName
 		netIfaces = append(netIfaces, netIface)
 	}
@@ -234,7 +239,43 @@ func resourceLibvirtDomainCreate(d *schema.ResourceData, meta interface{}) error
 		return err
 	}
 
-	return resourceLibvirtDomainRead(d, meta)
+	err = resourceLibvirtDomainRead(d, meta)
+	if err != nil {
+		return err
+	}
+
+	// we must read devices again in order to set some missing ip/MAC/host mappings
+	for i := 0; i < netIfacesCount; i++ {
+		prefix := fmt.Sprintf("network_interface.%d", i)
+		wfl, ok := d.GetOk(prefix + ".wait_for_lease")
+		if !ok || !wfl.(bool) {
+			continue
+		}
+		macI, ok := d.GetOk(prefix + ".mac")
+		mac := strings.ToUpper(macI.(string))
+		// if we were waiting for an IP address for this MAC, go ahead.
+		if pending, ok := partialNetIfaces[mac]; ok && pending {
+			// we should have the address now, and all the other params should be there too
+			address := d.Get(prefix + ".address").(string)
+			hostname := d.Get(prefix + ".hostname").(string)
+			networkUUID := d.Get(prefix + ".network_id").(string)
+			network, err := virConn.LookupNetworkByUUIDString(networkUUID)
+			if err != nil {
+				return fmt.Errorf("Can't retrieve network for ID '%s'", networkUUID)
+			}
+			networkName, err := network.GetName()
+			if err != nil {
+				return fmt.Errorf("Can't retrieve network name for ID '%s'", networkUUID)
+			}
+			log.Printf("[INFO] Adding IP/MAC/host=%s/%s/%s to '%s'", address, mac, hostname, networkName)
+			addHost(&network, address, mac, hostname)
+			if err != nil {
+				return fmt.Errorf("Could not add IP/MAC/host=%s/%s/%s to '%s': %s", address, mac, hostname, networkName, err)
+			}
+		}
+	}
+
+	return nil
 }
 
 func resourceLibvirtDomainUpdate(d *schema.ResourceData, meta interface{}) error {
